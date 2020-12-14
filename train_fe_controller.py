@@ -10,7 +10,7 @@ random_seed = 42
 # number of iterations before training controller
 warmup_iterations = 0                       
 # number of child models evaluated before each controller update
-num_rollouts_per_iteration = 5
+num_rollouts_per_iteration = 1
 # number of PG updates before saving controller policies
 save_policy_frequency = 5
 # save as a string so logger can log (yeah it's hacky I know)
@@ -24,6 +24,7 @@ device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('
 
 evaluator = Autoencoder(3, 3, [(1, 4), (4, 16), (16, 64), (64, 256), (256, 1024)])
 evaluator.load_state_dict(torch.load('autoencoderweights/autoencoder_weights_19.pt'))
+evaluator.freeze()
 
 evaluator.to(device)
 controller = FeatureExtractorController(

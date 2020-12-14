@@ -174,26 +174,23 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
         '''Calculate validation signal for child using hyperparameters
         '''
         loss_fn = torch.nn.MSELoss()
-        densifier = scn.SparseToDense(len(self.latent_space_size), 1)
+        densifier = scn.SparseToDense(len(self.latent_space_size), self.latent_space_channels)
 
         # move to gpu for eval
         child.to(self.device)
 
         total_loss = 0
         for (inputs, outputs) in self.val:
-            inputs = [torch.from_numpy(i).to(self.device) for i in inputs]
+            inputs = [torch.from_numpy(t).to(self.device) for t in inputs]
             inputs[1] = inputs[1].float().reshape(-1,1)
-            outputs = [torch.from_numpy(o).to(self.device) for o in outputs]
-            outputs[1] = outputs[1].float().reshape(-1,1)
 
-            latent_prediction = child(inputs)
-            prediction = self.evaluator.decoder(latent_prediction)
-            prediction = densifier(prediction)
+            predictions = child(inputs)
+            predictions = densifier(predictions)
 
-            target = self.evaluator(inputs)
+            target = self.evaluator.encoder(inputs)
             target = densifier(target)
 
-            loss = loss_fn(prediction, target)
+            loss = loss_fn(predictions, target)
             total_loss += loss.item()
 
         # take off gpu when finished

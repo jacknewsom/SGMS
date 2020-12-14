@@ -96,11 +96,11 @@ class Encoder(torch.nn.Module):
             return ret
 
     def unfreeze(self):
-        for p in model.parameters():
+        for p in self.parameters():
             p.requires_grad = True
 
     def freeze(self):
-        for p in model.parameters():
+        for p in self.parameters():
             p.requires_grad = False
 
 
@@ -134,11 +134,11 @@ class Decoder(torch.nn.Module):
             return ret
 
     def unfreeze(self):
-        for p in model.parameters():
+        for p in self.parameters():
             p.requires_grad = True
 
     def freeze(self):
-        for p in model.parameters():
+        for p in self.parameters():
             p.requires_grad = False
 
 
