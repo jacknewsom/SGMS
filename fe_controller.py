@@ -11,7 +11,8 @@ import os
 class FeatureExtractorController(BaseController):
     def __init__(
         self, 
-        evaluator,
+        encoder,
+        encoder_features,
         N,
         latent_space_size,
         latent_space_channels,
@@ -25,7 +26,8 @@ class FeatureExtractorController(BaseController):
         super(FeatureExtractorController, self).__init__()
 
         self.archspace = FeatureExtractorSupermodel(
-            evaluator,
+            encoder,
+            encoder_features,
             N,
             latent_space_size,
             latent_space_channels,

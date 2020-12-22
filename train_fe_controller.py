@@ -22,16 +22,22 @@ torch.manual_seed(random_seed)
 np.random.seed(random_seed)
 device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
-evaluator = Autoencoder(3, 3, [(1, 4), (4, 16), (16, 64), (64, 256), (256, 1024)])
-evaluator.load_state_dict(torch.load('autoencoderweights/autoencoder_weights_19.pt'))
+dimension = 3
+reps = 3
+encoder_layers = [(1, 4), (4, 8), (8, 16), (16, 32), (32, 64)]
+# [(output_features, input_features), ...]
+decoder_layers = [(32, 128), (16, 64), (8, 32), (4, 16), (1, 8), (1, 2, False)]
+model = Autoencoder(dimension, reps, encoder_layers, decoder_layers, unet=True, use_sparsify=False)
+evaluator = model.encoder
 evaluator.freeze()
 
 evaluator.to(device)
 controller = FeatureExtractorController(
-    evaluator=evaluator, 
+    encoder=evaluator,
+    encoder_features=encoder_layers,
     N=4, 
-    latent_space_size=[2,2,2], 
-    latent_space_channels=1024, 
+    latent_space_size=torch.LongTensor([4,4,4]),
+    latent_space_channels=64, 
     archspace_epochs=10, 
     reward_map_fn=reward_map_fn, 
     device=device)
@@ -92,7 +98,7 @@ while not controller.has_converged():
 
         logger.add_scalar("Loss/argmax", quality, iteration)
 
-        if quality < 0.05:
+        if quality < 1e-7:
             controller.converged = True
 
     else:

@@ -1,10 +1,29 @@
 from module.searchspace.architectures.base_architecture_space import BaseArchitectureSpace
 from module.utils.muon_track_dataset import MuonPose
+from models import Encoder, Decoder, get_block_name
 from collections import OrderedDict
-from models import Encoder, get_block_name
+import numpy as np
 import sparseconvnet as scn
 import torch
 import os
+
+class FeWrapper(torch.nn.Module):
+    def __init__(self, encoder, feature_extractor, decoder):
+        super(FeWrapper, self).__init__()
+        self.encoder = encoder
+        # we're not training the encoder
+        self.encoder.freeze()
+        self.feature_extractor = feature_extractor
+        self.decoder = decoder
+        self.sigmoid = scn.Sigmoid()
+
+    def forward(self, primary_inputs, secondary_inputs):
+        latent, blocks = self.encoder(primary_inputs, return_blocks=True)
+        secondary_features = self.feature_extractor(secondary_inputs)
+        blocks.append(secondary_features)
+        prediction = self.decoder([latent, blocks[::-1]])
+        prediction = self.sigmoid(prediction)
+        return prediction
 
 class FeatureExtractorSupermodel(BaseArchitectureSpace):
     '''
@@ -21,11 +40,12 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
                   latent encoding
     '''
 
-    train = MuonPose("/home/jack/classes/thesis/autohas/LArCentroids/train/")
-    val = MuonPose("/home/jack/classes/thesis/autohas/LArCentroids/val/")
+    train = MuonPose("/home/jack/classes/thesis/autohas/LArCentroids/train/", return_energy=True)
+    val = MuonPose("/home/jack/classes/thesis/autohas/LArCentroids/val/", return_energy=True)
 
     def __init__(self,
-        evaluator,
+        encoder,
+        encoder_features,
         N,
         latent_space_size,
         latent_space_channels,
@@ -36,8 +56,11 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
         ):
         super(FeatureExtractorSupermodel, self).__init__()
 
-        # autoencoder for training and testing feature extractor
-        self.evaluator = evaluator
+        # encoder for training and testing feature extractor
+        self.encoder = encoder
+        self.encoder_features = encoder_features
+
+        assert torch.all((input_space_size / 2**(N+1)) == latent_space_size), (input_space_size / 2**(N+1), latent_space_size)
 
         # child models must have this many layers
         self.N = N
@@ -117,7 +140,16 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
             if block_name in self.explored_blocks:
                 state_dict = torch.load(self.weight_directory + block_name)
                 child.blocks[child.block_names[block_name]].load_state_dict(state_dict)
-        return child
+
+        c_in = n_layers[-1][1] + self.encoder_features[-1][1]
+        decoder_features = [(self.encoder_features[-1][0], c_in)]
+        for i in range(len(self.encoder_features)):
+            decoder_features.append((decoder_features[-1][0]//2, decoder_features[-1][1]//2))
+        decoder_features[-1] = (decoder_features[-1][0], 1+decoder_features[-2][0], False)
+        decoder = Decoder(len(self.latent_space_size), decoder_features, unet=True, use_sparsify=False, device=self.device)
+
+        model = FeWrapper(self.encoder, child, decoder)
+        return model
 
     def train_child(self, child, hyperparameters, indentation_level=0):
         '''Train child model using hyperparameters
@@ -135,8 +167,11 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
         loss_fn = torch.nn.MSELoss()
 
         optimizer_fn = hyperparameters['optimizer']
-        optimizer = optimizer_fn(child.parameters())
+        parameters = [child.feature_extractor.parameters(), child.decoder.parameters()]
+        parameters = [{'params': p} for p in parameters]
+        optimizer = optimizer_fn(parameters)
 
+        sparsifier = scn.InputLayer(len(self.input_space_size), self.input_space_size)
         densifier = scn.SparseToDense(len(self.latent_space_size), self.latent_space_channels)
 
         print_(f"Training child for {self.epochs} epochs...")
@@ -144,17 +179,21 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
             print_()
             print_(f"Epoch {epoch}")
             total_loss = 0
-            for i, (inputs, outputs) in enumerate(self.train):
-                inputs = [torch.from_numpy(t).to(self.device) for t in inputs]
-                inputs[1] = inputs[1].float().reshape(-1,1)
+            for i, (inputs, targets) in enumerate(self.train):
+                inputs = [[torch.from_numpy(t).to(self.device) for t in j] for j in inputs]
+                primary, secondary = inputs[0], inputs[1]
+                primary[1] = primary[1].float().reshape(-1,1)
+                secondary[1] = secondary[1].float().reshape(-1,1)
 
-                predictions = child(inputs)
+                predictions = child(primary, secondary)
                 predictions = densifier(predictions)
 
-                target = self.evaluator.encoder(inputs)
-                target = densifier(target)
+                targets = [torch.from_numpy(t).to(self.device) for t in targets]
+                targets[1] = targets[1].float().reshape(-1, 1)
+                targets = sparsifier(targets)
+                targets = densifier(targets)
 
-                loss = loss_fn(predictions, target)
+                loss = loss_fn(predictions, targets)
                 total_loss += loss.item()
 
                 optimizer.zero_grad()
@@ -162,7 +201,8 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
                 optimizer.step()
 
                 if i % 10 == 0:
-                    print_(f"\t{i/len(self.train):.3f}% loss : {loss.item():.3f}", end='\r')
+                    loss_str = np.format_float_scientific(loss.item(), precision=5)
+                    print_(f"\t{100*i/len(self.train):.3f}% loss : {loss_str}", end='\r')
             total_loss /= len(self.train)
             print_(f"\tAverage loss : {total_loss:.3f}")
         print()
@@ -174,23 +214,28 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
         '''Calculate validation signal for child using hyperparameters
         '''
         loss_fn = torch.nn.MSELoss()
+        sparsifier = scn.InputLayer(len(self.input_space_size), self.input_space_size)        
         densifier = scn.SparseToDense(len(self.latent_space_size), self.latent_space_channels)
 
         # move to gpu for eval
         child.to(self.device)
 
         total_loss = 0
-        for (inputs, outputs) in self.val:
-            inputs = [torch.from_numpy(t).to(self.device) for t in inputs]
-            inputs[1] = inputs[1].float().reshape(-1,1)
+        for (inputs, targets) in self.val:
+            inputs = [[torch.from_numpy(t).to(self.device) for t in j] for j in inputs]
+            primary, secondary = inputs[0], inputs[1]
+            primary[1] = primary[1].float().reshape(-1,1)
+            secondary[1] = secondary[1].float().reshape(-1,1)
 
-            predictions = child(inputs)
+            predictions = child(primary, secondary)
             predictions = densifier(predictions)
 
-            target = self.evaluator.encoder(inputs)
-            target = densifier(target)
+            targets = [torch.from_numpy(t).to(self.device) for t in targets]
+            targets[1] = targets[1].float().reshape(-1, 1)
+            targets = sparsifier(targets)
+            targets = densifier(targets)
 
-            loss = loss_fn(predictions, target)
+            loss = loss_fn(predictions, targets)
             total_loss += loss.item()
 
         # take off gpu when finished
@@ -204,6 +249,7 @@ class FeatureExtractorSupermodel(BaseArchitectureSpace):
         return signal
 
     def save_child(self, child):
+        child = child.feature_extractor
         for layer_name in child.block_names:
             layer = child.blocks[child.block_names[layer_name]]
             torch.save(layer.state_dict(), self.weight_directory + layer_name)
