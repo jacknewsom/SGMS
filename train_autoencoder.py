@@ -14,6 +14,7 @@ now = datetime.now().strftime("%b-%d-%y_%H:%M:%S")
 logger = SummaryWriter(log_dir=f"autoencoder_run/{now}/")
 
 device = 'cuda:0'
+
 dimension = 3
 reps = 3
 encoder_layers = [(1, 4), (4, 8), (8, 16), (16, 32), (32, 64)]
@@ -21,7 +22,8 @@ encoder_layers = [(1, 4), (4, 8), (8, 16), (16, 32), (32, 64)]
 decoder_layers = [(32, 128), (16, 64), (8, 32), (4, 16), (1, 8), (1, 2, False)]
 
 model = Autoencoder(dimension, reps, encoder_layers, decoder_layers, unet=True, use_sparsify=False)
-model.to_(device)
+model = scn.Sequential().add(scn.InputLayer(dimension, torch.LongTensor([128,128,12]))).add(model)
+model.to(device)
 
 loss_fn = torch.nn.MSELoss()
 optimizer = torch.optim.AdamW(model.parameters())
@@ -31,10 +33,6 @@ densifier = scn.Sequential().add(
 ).add(
     scn.SparseToDense(3, 1)
 )
-
-print("Want to test or load anything?")
-import code
-code.interact(local=locals())
 
 for epoch in range(20):
     print(f"Epoch {epoch}")
@@ -49,19 +47,10 @@ for epoch in range(20):
         target[1] = target[1].float().reshape(-1, 1)
 
         prediction = model(inputs)
-        if len(prediction.features) == 1:
-            print("empty prediction at i=", i)
-            import code
-            code.interact(local=locals())
         dense_prediction = densifier[1](prediction)
-
         dense_target = densifier(target)
 
         loss = loss_fn(dense_prediction, dense_target)
-        if torch.isnan(loss):
-            print("nanloss at i=",i)
-            import code
-            code.interact(local=locals())
 
         optimizer.zero_grad()
         loss.backward()

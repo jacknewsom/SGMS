@@ -137,11 +137,7 @@ class Encoder(torch.nn.Module):
                 )
                 n_in = n_out
             n_out = n_layers[i][1]
-            '''
-            block.add(
-                scn.BatchNormLeakyReLU(n_in, leakiness)
-            )
-            '''
+
             block.add(
                 scn.LeakyReLU(leakiness)
             )
@@ -206,11 +202,6 @@ class Decoder(torch.nn.Module):
             n_in, n_out = n_layers[i][1], n_layers[i][0]
             block = scn.Sequential()
 
-            '''
-            block.add(
-                scn.BatchNormLeakyReLU(n_in, 0)
-            )
-            '''
             block.add(
                 scn.LeakyReLU(0)
             )
