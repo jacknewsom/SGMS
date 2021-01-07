@@ -33,7 +33,8 @@ class SparseConcatenate(torch.nn.Module):
             a.features,
             b.get_spatial_locations(),
             b.features)
-        output = scn.InputLayer(len(a.spatial_size), a.spatial_size).to(self.device)([unique_locations, unique_features])
+#        output = scn.InputLayer(len(a.spatial_size), a.spatial_size).to(self.device)([unique_locations, unique_features])
+
         return output
 
 class SparseConcatenateFunction(torch.autograd.Function):
@@ -65,10 +66,38 @@ class SparseConcatenateFunction(torch.autograd.Function):
 
         return None, grad_input_a, None, grad_input_b
 
+class AttentionBlock(torch.nn.Module):
+    def __init__(self, dimension, n_in, kernel, leakiness, unpool_size, unpool_stride):
+        super(AttentionBlock, self).__init__()
 
-class BatchNormLeakyReLU(torch.nn.Module):
-    def __init__(self,):
-        pass
+        self.block = scn.Sequential()
+        self.block.add(
+            scn.SubmanifoldConvolution(dimension, n_in, n_in // 2, kernel, False)
+        ).add(
+            scn.BatchNormLeakyReLU(n_in // 2, leakiness=leakiness)
+        ).add(
+            scn.SubmanifoldConvolution(dimension, n_in // 2, n_in // 4, kernel, False)
+        ).add(
+            scn.BatchNormLeakyReLU(n_in // 4, leakiness=leakiness)
+        ).add(
+            scn.SubmanifoldConvolution(dimension, n_in // 4, 2, kernel, False)
+        )
+
+        self.softmax = torch.nn.Softmax(dim=1)
+        self.unpool = scn.UnPooling(dimension, unpool_size, unpool_stride)
+
+    def forward(self, x):
+        raw_prob = self.block(x)
+        probabilities = self.softmax(raw_prob.features)
+
+        mask = scn.SparseConvNetTensor()
+        mask.metadata = x.metadata
+        mask.spatial_size = x.spatial_size
+        mask.features = probabilities.argmax(dim=1).reshape(-1, 1).float()
+
+        unpooled_mask = self.unpool(mask)
+
+        return unpooled_mask
 
 def resnet_block(dimension, n_in, n_out, kernel, leakiness=0, computation='convolution'):
     '''Build and return ResNet block
@@ -92,13 +121,11 @@ def resnet_block(dimension, n_in, n_out, kernel, leakiness=0, computation='convo
             scn.NetworkInNetwork(n_in, n_out, False)
         ).add(
             scn.Sequential().add(
-#                scn.BatchNormLeakyReLU(n_in, leakiness=leakiness)
-                scn.LeakyReLU(leakiness)
+                scn.BatchNormLeakyReLU(n_in, leakiness=leakiness)
             ).add(
                 computation(n_in, n_out)
             ).add(
-#                scn.BatchNormLeakyReLU(n_out, leakiness=leakiness)
-                scn.LeakyReLU(leakiness)
+                scn.BatchNormLeakyReLU(n_out, leakiness=leakiness)
             ).add(
                 computation(n_out, n_out)
             )
@@ -139,7 +166,7 @@ class Encoder(torch.nn.Module):
             n_out = n_layers[i][1]
 
             block.add(
-                scn.LeakyReLU(leakiness)
+                scn.BatchNormLeakyReLU(n_in, leakiness)
             )
             if len(n_layers[i]) == 2:
                 block.add(
@@ -162,6 +189,7 @@ class Encoder(torch.nn.Module):
             self.blocks.append(block)
             self.block_names[block_name] = len(self.blocks)-1
         self.blocks = torch.nn.ModuleList(self.blocks)
+        self.blocks.to(self.device)
 
     def forward(self, x, return_blocks=False):
         if hasattr(self, "input_layer"):
@@ -173,7 +201,7 @@ class Encoder(torch.nn.Module):
             rets.append(ret)
 
         if return_blocks:
-            return ret, rets[:-1]
+            return rets
         else:
             return ret
 
@@ -187,7 +215,7 @@ class Encoder(torch.nn.Module):
 
 
 class Decoder(torch.nn.Module):
-    def __init__(self, dimension, n_layers, unet=False, name='decoder', use_sparsify=True, device=None):
+    def __init__(self, dimension, n_layers, unet=False, name='decoder', is_submanifold=False, use_sparsify=True, device=None):
         super(Decoder, self).__init__()
         self.dimension = dimension
         self.n_layers = n_layers
@@ -199,15 +227,19 @@ class Decoder(torch.nn.Module):
         self.block_names = {}
 
         for i in range(len(n_layers)):
-            n_in, n_out = n_layers[i][1], n_layers[i][0]
+            n_in, n_out = n_layers[i][0], n_layers[i][1]
             block = scn.Sequential()
 
             block.add(
-                scn.LeakyReLU(0)
+                scn.BatchNormLeakyReLU(n_in, 0)
             )
-            if len(n_layers[i]) == 2:
+            if len(n_layers[i]) == 2 and not is_submanifold:
                 block.add(
                     scn.FullConvolution(dimension, n_in, n_out, 2, 2, False)
+                )
+            elif len(n_layers[i]) == 2 and is_submanifold:
+                block.add(
+                    scn.Deconvolution(dimension, n_in, n_out, 2, 2, False)
                 )
             elif len(n_layers[i]) == 3 and n_layers[i][2] == False:
                 # don't upsample
@@ -222,6 +254,7 @@ class Decoder(torch.nn.Module):
             self.blocks.append(block)
             self.block_names[block_name] = len(self.blocks)-1
         self.blocks = torch.nn.ModuleList(self.blocks)
+        self.blocks.to(self.device)
 
     def forward(self, x, return_blocks=False):
         if not self.unet:
@@ -230,32 +263,29 @@ class Decoder(torch.nn.Module):
                 ret = self.blocks[i](rets[i])
                 rets.append(ret)
         else:
-            assert type(x) == list, f'`x` must be `list`, but {type(x)} was provided'
-            assert len(x) == 2, f'`x` must be 2 long, but was {len(x)} long'
-#            assert len(x[1]) == len(self.blocks), f'Must provide as many inputs as blocks, but {len(x[1])} inputs were provided for {len(self.blocks)} blocks'
-            x, blocks = x
+            '''
+            `x` is list of inputs for each layer of `self`. `x[0]` should have the same number of feature channels
+            as the first block in `self`, then `x[1]` should have `self.blocks[1].input_features - self.blocks[0](x[0]).features`
+            features, `x[2]` should have `self.blocks[2].input_features - self.blocks[1](self.blocks[0](x[0])).features`, etc.
+            '''
+            assert type(x) == list
+            assert len(x) == len(self.blocks)
 
             concatenator = SparseConcatenate(self.device)
-            rets = [x]
-            for i in range(len(self.blocks)):
-                if blocks[i] == None:
-                    # need to double number of channels in ret
-                    locations, features = rets[i].get_spatial_locations(), rets[i].features
-                    features_ = torch.hstack((features, features))
-
-                    loader = scn.InputLayer(len(rets[i].spatial_size), rets[i].spatial_size)
-                    loader.to(self.device)
-                    inputs = loader([locations, features_])
-                else:
-                    inputs = concatenator(rets[i], blocks[i])
-
-                ret = self.blocks[i](inputs)
-                rets.append(ret)
-
+            rets = [x[0]]
+            prev = x[0]
+            for i, block in enumerate(self.blocks):
+                assert prev.features.shape[1] == block[1].nIn, f'Input to block {i} should have {block[1].nIn} features, but had {prev.features.shape[1]}'
+                prev = block(prev)
+                
+                if i < len(self.blocks)-1:
+                    encoder_output = x[i+1]
+                    prev = scn.JoinTable()([prev, encoder_output])
+                rets.append(prev)
         if return_blocks:
-            return ret, rets[:-1]
+            return rets
         else:
-            return ret
+            return rets[-1]
 
     def unfreeze(self):
         for p in self.parameters():
@@ -264,6 +294,54 @@ class Decoder(torch.nn.Module):
     def freeze(self):
         for p in self.parameters():
             p.requires_grad = False
+
+class Decoder_(torch.nn.Module):
+    '''One that makes more sense
+    '''
+    def __init__(self, dimension, n_layers, reps, device='cpu:0'):
+        super(Decoder_, self).__init__()
+        self.dimension = dimension
+        self.n_layers = n_layers
+        self.device = device
+        self.concatenator = scn.JoinTable()
+
+        blocks = []
+        for i in range(n_layers):
+            n_in, n_out = n_layers[i]
+
+            block = scn.Sequential()
+            for rep in reps:
+                block.add(
+                    resnet_block(dimension, n_in, n_out, 3, leakiness, computation='submanifoldconvolution')
+                )
+                n_in = n_out
+
+            block.add(
+                scn.Deconvolution(dimension, n_in, n_out, 2, 2, False)
+            )
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.blocks.to(self.device)
+
+    def forward(self, x):
+        '''
+        `x` is list of inputs for each layer of `self`. `x[0]` should have the same number of feature channels
+        as the first block in `self`, then `x[1]` should have `self.blocks[1].input_features - self.blocks[0](x[0]).features`
+        features, `x[2]` should have `self.blocks[2].input_features - self.blocks[1](self.blocks[0](x[0])).features`, etc.
+        '''
+        assert type(x) == list
+        assert len(x) == len(self.blocks)
+
+        rets = [x[0]]
+        prev = x[0]
+        for i, block in enumerate(self.blocks):
+            assert prev.features.shape[1] == block[1].nIn, f'Input to block {i} should have {block[1].nIn} features, but had {prev.features.shape[1]}'
+            prev = block(prev)
+            
+            if i < len(self.blocks)-1:
+                encoder_output = x[i+1]
+                prev = self.concatenator([prev, encoder_output])
+            rets.append(prev)
+        return rets
 
 class Autoencoder(torch.nn.Module):
     def __init__(self, dimension, reps, encoder_layers, decoder_layers, unet=False, use_sparsify=False, device='cuda:0'):
@@ -334,4 +412,29 @@ class Autoencoder(torch.nn.Module):
         self.encoder.freeze()
         self.decoder.freeze()
 
+class YNet(torch.nn.Module):
+    def __init__(self, dimension, reps, encoder_layers, leakiness, device):
+        super(YNet, self).__init__()
+        self.concatenator = scn.JoinTable()
+        self.primary = Encoder(dimension, reps, encoder_layers, input_layer=torch.LongTensor([128,128,128]), device=device)
+        self.secondary = Encoder(dimension, reps, encoder_layers, input_layer=torch.LongTensor([128,128,128]), device=device)
+        self.decoder = Decoder(dimension, decoder_layers, unet=True, is_submanifold=True, device=device)
 
+        '''
+        attention_block_layers = [d[1] for d in decoder_layers]
+        self.attention_blocks = [AttentionBlock(dimension, attention_block_layers, 3, leakiness, 2, 2)]
+        '''
+
+    def forward(self, x_primary, x_secondary):
+        latent_primary = self.primary(x_primary, return_blocks=True)
+        latent_secondary = self.secondary(x_secondary)
+
+        combined_latent = self.concatenator([latent_primary[-1], latent_secondary])
+        encoded_blocks = latent_primary[:-1] + [combined_latent]
+
+        decoded_blocks = self.decoder(encoded_blocks)
+
+        attention_masks = self.attention_network(decoded_blocks)
+        prediction = attention_masks[-1]
+
+        return prediction
