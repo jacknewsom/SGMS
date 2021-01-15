@@ -66,38 +66,6 @@ class SparseConcatenateFunction(torch.autograd.Function):
 
         return None, grad_input_a, None, grad_input_b
 
-class AttentionBlock(torch.nn.Module):
-    def __init__(self, dimension, n_in, kernel, leakiness, unpool_size, unpool_stride):
-        super(AttentionBlock, self).__init__()
-
-        self.block = scn.Sequential()
-        self.block.add(
-            scn.SubmanifoldConvolution(dimension, n_in, n_in // 2, kernel, False)
-        ).add(
-            scn.BatchNormLeakyReLU(n_in // 2, leakiness=leakiness)
-        ).add(
-            scn.SubmanifoldConvolution(dimension, n_in // 2, n_in // 4, kernel, False)
-        ).add(
-            scn.BatchNormLeakyReLU(n_in // 4, leakiness=leakiness)
-        ).add(
-            scn.SubmanifoldConvolution(dimension, n_in // 4, 2, kernel, False)
-        )
-
-        self.softmax = torch.nn.Softmax(dim=1)
-        self.unpool = scn.UnPooling(dimension, unpool_size, unpool_stride)
-
-    def forward(self, x):
-        raw_prob = self.block(x)
-        probabilities = self.softmax(raw_prob.features)
-
-        mask = scn.SparseConvNetTensor()
-        mask.metadata = x.metadata
-        mask.spatial_size = x.spatial_size
-        mask.features = probabilities.argmax(dim=1).reshape(-1, 1).float()
-
-        unpooled_mask = self.unpool(mask)
-
-        return unpooled_mask
 
 def resnet_block(dimension, n_in, n_out, kernel, leakiness=0, computation='convolution'):
     '''Build and return ResNet block
@@ -137,6 +105,53 @@ def resnet_block(dimension, n_in, n_out, kernel, leakiness=0, computation='convo
 
 def get_block_name(model_name, dimension, reps, n_in, n_out, leakiness):
     return f'{model_name}:{dimension}-{reps}-{n_in}-{n_out}-{leakiness}'
+
+class SparseMultiply(torch.nn.Module):
+    def __init__(self):
+        super(SparseMultiply, self).__init__()
+
+    def forward(self, a, b):
+        output = scn.SparseConvNetTensor()
+        output.metadata = a.metadata
+        output.spatial_size = a.spatial_size
+        output.features = a.features * b.features
+
+        return output
+
+class AttentionBlock(torch.nn.Module):
+    def __init__(self, dimension, n_in, kernel, leakiness, unpool_size, unpool_stride, threshold):
+        super(AttentionBlock, self).__init__()
+
+        self.block = scn.Sequential()
+        self.block.add(
+            scn.SubmanifoldConvolution(dimension, n_in, n_in // 2, kernel, False)
+        ).add(
+            scn.BatchNormLeakyReLU(n_in // 2, leakiness=leakiness)
+        ).add(
+            scn.SubmanifoldConvolution(dimension, n_in // 2, n_in // 4, kernel, False)
+        ).add(
+            scn.BatchNormLeakyReLU(n_in // 4, leakiness=leakiness)
+        ).add(
+            scn.SubmanifoldConvolution(dimension, n_in // 4, 2, kernel, False)
+        )
+
+        self.softmax = torch.nn.Softmax(dim=1)
+        self.unpool = scn.UnPooling(dimension, unpool_size, unpool_stride)
+        self.threshold = threshold
+
+    def forward(self, x):
+        raw_prob = self.block(x)
+        probabilities = self.softmax(raw_prob.features)
+
+        mask = scn.SparseConvNetTensor()
+        mask.metadata = x.metadata
+        mask.spatial_size = x.spatial_size
+        mask.features = (probabilities[:, 1] > self.threshold).float().reshape(-1, 1)
+
+        unpooled_mask = self.unpool(mask)
+        unpooled_mask.features = (unpooled_mask.features > self.threshold).astype
+
+        return unpooled_mask
 
 class Encoder(torch.nn.Module):
     def __init__(self, dimension, reps, n_layers, leakiness=0, input_layer=None, name='encoder', device=None):
@@ -413,17 +428,17 @@ class Autoencoder(torch.nn.Module):
         self.decoder.freeze()
 
 class YNet(torch.nn.Module):
-    def __init__(self, dimension, reps, encoder_layers, leakiness, device):
+    def __init__(self, dimension, reps, encoder_layers, leakiness, attention_threshold, device):
         super(YNet, self).__init__()
         self.concatenator = scn.JoinTable()
         self.primary = Encoder(dimension, reps, encoder_layers, input_layer=torch.LongTensor([128,128,128]), device=device)
         self.secondary = Encoder(dimension, reps, encoder_layers, input_layer=torch.LongTensor([128,128,128]), device=device)
         self.decoder = Decoder(dimension, decoder_layers, unet=True, is_submanifold=True, device=device)
 
-        '''
         attention_block_layers = [d[1] for d in decoder_layers]
-        self.attention_blocks = [AttentionBlock(dimension, attention_block_layers, 3, leakiness, 2, 2)]
-        '''
+        self.attention = [AttentionBlock(dimension, b, 3, leakiness, 2, 2, attention_threshold) for b in attention_block_layers]
+
+        self.multiplier = SparseMultiply()
 
     def forward(self, x_primary, x_secondary):
         latent_primary = self.primary(x_primary, return_blocks=True)
@@ -434,7 +449,11 @@ class YNet(torch.nn.Module):
 
         decoded_blocks = self.decoder(encoded_blocks)
 
-        attention_masks = self.attention_network(decoded_blocks)
-        prediction = attention_masks[-1]
-
-        return prediction
+        mask = None
+        for decoded, attn_block in zip(decoded_blocks, self.attention):
+            if mask is None:
+                input_ = decoded
+            else:
+                input_ = self.multiplier(mask, decoded)
+            mask = attn_block(input_)
+        return mask
